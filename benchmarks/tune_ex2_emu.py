@@ -98,28 +98,52 @@ def detect_sm103():
     return is_sm103
 
 
+def _get_gpu_selector():
+    """Return the nvidia-smi GPU selector (-i argument) for the current device.
+
+    Resolves CUDA_VISIBLE_DEVICES so that nvidia-smi targets the same physical
+    GPU that PyTorch is using.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible:
+        entries = [e.strip() for e in visible.split(",") if e.strip()]
+        if entries:
+            idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            return entries[idx] if idx < len(entries) else entries[0]
+    if torch.cuda.is_available():
+        return str(torch.cuda.current_device())
+    return None
+
+
+def _nvidia_smi_cmd(*args):
+    """Build nvidia-smi command for the current GPU, prepending sudo when not root."""
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    cmd = prefix + ["nvidia-smi"]
+    selector = _get_gpu_selector()
+    if selector is not None:
+        cmd += ["-i", selector]
+    return cmd + list(args)
+
+
 def _query_clocks():
     """Return (current_mhz_str, max_mhz_str) or (None, None) on failure."""
     result = subprocess.run(
-        [
-            "nvidia-smi",
+        _nvidia_smi_cmd(
             "--query-gpu=clocks.current.graphics,clocks.max.graphics",
             "--format=csv,noheader,nounits",
-        ],
+        ),
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         return None, None
-    first_line = result.stdout.strip().splitlines()[0]
-    cur, max_clk = first_line.split(", ")
-    return cur, max_clk
-
-
-def _nvidia_smi_cmd(*args):
-    """Build nvidia-smi command, prepending sudo when not running as root."""
-    prefix = [] if os.geteuid() == 0 else ["sudo"]
-    return prefix + ["nvidia-smi"] + list(args)
+    lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None, None
+    fields = [f.strip() for f in lines[0].split(",")]
+    if len(fields) < 2 or not fields[0] or not fields[1]:
+        return None, None
+    return fields[0], fields[1]
 
 
 def lock_clocks(max_mhz):
@@ -153,12 +177,14 @@ def setup_clocks(do_lock):
             atexit.register(unlock_clocks)
             print("GPU clocks will be unlocked on exit.")
         else:
-            print(f"  To lock manually: sudo nvidia-smi --lock-gpu-clocks {max_clk}")
+            lock_cmd = " ".join(_nvidia_smi_cmd("--lock-gpu-clocks", max_clk))
+            print(f"  To lock manually: {lock_cmd}")
     else:
         if cur != max_clk:
             print(f"WARNING: GPU clocks not locked ({cur} MHz, max {max_clk} MHz).")
             print("  Benchmark results may vary between runs.")
-            print(f"  To lock: sudo nvidia-smi --lock-gpu-clocks {max_clk}")
+            lock_cmd = " ".join(_nvidia_smi_cmd("--lock-gpu-clocks", max_clk))
+            print(f"  To lock: {lock_cmd}")
     print()
 
 
@@ -240,6 +266,7 @@ def main():
     args = parse_args()
     setup_clocks(args.lock_clocks)
     original_src = read_file()
+    atexit.register(write_file, original_src)
     config = parse_tuning_config(original_src)
 
     hdim, hdim_v = parse_headdim(args.headdim)
@@ -268,8 +295,8 @@ def main():
     freq_values = [0, 6, 8, 10, 12, 14, 16, 20, 24, 32]
     start_frg_values = [0, 1]
     # hd256 inner loop steps k by 2, so k%freq only takes even values.
-    # Meaningful res values that produce distinct hw:emu ratios:
-    #   freq=4, res=3 → 50:50 | freq=8, res=6 → 25:75 | freq=8, res=4 → 50:50 (diff freq)
+    # Meaningful res values that produce distinct hw:emu ratios on this sweep grid:
+    #   freq=6, res=3 → 50:50 | freq=8, res=6 → 25:75 | freq=8, res=4 → 50:50 (diff freq)
     # We sweep a representative set; the script picks the best combo.
     hd256_res_values = [3, 6, 4]
 
@@ -441,7 +468,6 @@ def main():
 
     print(f"\nTo apply, update _TUNING_CONFIG in {KERNEL_FILE}")
 
-    # Restore original
     write_file(original_src)
     print("Restored original file.")
 
