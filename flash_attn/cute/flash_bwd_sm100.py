@@ -1751,6 +1751,7 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block = self._scheduled_n_block(n_block, head_idx, batch_idx, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -2357,6 +2358,7 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block = self._scheduled_n_block(n_block, head_idx, batch_idx, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -2971,6 +2973,7 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block = self._scheduled_n_block(n_block, head_idx, batch_idx, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -3421,6 +3424,22 @@ class FlashAttentionBackwardSm100:
             work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
+    def _scheduled_n_block(
+        self,
+        schedule_n_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        blocksparse_tensors: Optional[BlockSparseTensors],
+    ) -> Int32:
+        """Map the scheduler's dense n-rank to the actual KV block for explicit dQ order."""
+        n_block = schedule_n_block
+        if const_expr(self.deterministic and self.use_block_sparsity):
+            assert blocksparse_tensors is not None
+            if const_expr(blocksparse_tensors.dq_kv_order is not None):
+                n_block = blocksparse_tensors.dq_kv_order[batch_idx, head_idx, schedule_n_block]
+        return n_block
+
+    @cute.jit
     def _dq_semaphore_lock_value(
         self,
         iter_idx: Int32,
@@ -3508,6 +3527,7 @@ class FlashAttentionBackwardSm100:
         )
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block = self._scheduled_n_block(n_block, head_idx, batch_idx, blocksparse_tensors)
             n_block_cta_group = n_block // self.cta_group_size  # for 2cta
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
